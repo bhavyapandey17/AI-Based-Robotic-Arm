@@ -1,0 +1,2059 @@
+#!/usr/bin/env python3
+"""
+AI-Based Robotic Arm Vision System  v5
+─────────────────────────────────────────────────────────────────
+ Features:
+  • Motion recordings: record servo keyframes, name/edit/delete,
+    playback with per-step delays
+  • Pick rules: per-trained-object pick→drop configuration with
+    base-angle and drop delay stored to JSON
+  • Gripper delay: configurable gap between arm movement and gripper
+  • All data stored in DATA_DIR (same folder as this .py file) →
+    fully portable, PC-independent
+─────────────────────────────────────────────────────────────────
+"""
+
+import cv2, numpy as np, requests, json, os, time, threading, sys, struct, wave, io
+try:
+    import beepy as _beepy
+    def _beep(n):
+        for _ in range(n):
+            _beepy.beep(sound=1)
+            time.sleep(0.18)
+except ImportError:
+    # beepy not installed — fallback to OS beep via print (terminal bell)
+    def _beep(n):
+        for _ in range(n):
+            print("\a", end="", flush=True)
+            time.sleep(0.18)
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
+
+# ══════════════════════════════════════════════════════════════
+#  CONFIGURATION  ← edit these at the top
+# ══════════════════════════════════════════════════════════════
+# ── ESP32 IP address ───────────────────────────────────────────
+# AP mode  (WIFI_MODE="AP"):   always 192.168.4.1  ← connect PC to "RobotArm" WiFi
+# STA mode (WIFI_MODE="STA"):  check Serial Monitor for the assigned IP
+# APSTA mode:                  use 192.168.4.1 (AP) or the STA IP — both work
+ESP32_IP          = "192.168.4.1"   # ← change to STA IP if using STA/APSTA via router
+PORT              = 5000
+
+# Gripper sequencing: after non-gripper axes reach target,
+# wait this many seconds before moving the gripper.
+GRIPPER_DELAY_SEC = 0.5      # ← change here (e.g. 1.5, 3.0 …)
+
+# Smooth-move step size tolerance: consider axis "done" when it
+# is within DONE_THRESHOLD degrees of its target.
+DONE_THRESHOLD    = 3
+
+# ── Detection accuracy filters ──────────────────────────────
+# Minimum contour area (px²) for trained objects.
+# 800 was too small — accepted distant/tiny blobs.
+# At 640×480 a typical table object is ~4000–20000 px².
+# Raise this if distant objects still slip through.
+MIN_OBJECT_AREA   = 4000
+
+# Minimum contour area for unknown objects (higher = stricter).
+MIN_UNKNOWN_AREA  = 5000
+
+# Minimum confidence % to report a trained-object detection.
+# Confidence = area/5000*100, so 4000px²→80%, 3000px²→60%.
+MIN_CONFIDENCE    = 60.0
+
+# Minimum solidity (contour area / convex hull area) 0..1.
+# Rejects noise, thin edges, partial far-away shapes.
+# 0.65 is a good default; raise toward 0.80 for tighter rejection.
+MIN_SOLIDITY      = 0.65
+
+# Working-zone ROI: only detect objects inside this vertical band
+# of the frame (fraction 0.0=top … 1.0=bottom).
+# Distant objects appear near the top; set ROI_TOP > 0 to exclude them.
+# Example: ROI_TOP=0.30 ignores the top 30 % of the frame.
+# Set ROI_TOP=0.0, ROI_BOTTOM=1.0 to disable (full frame).
+ROI_TOP           = 0.30   # ignore top 30 % — where distant objects live
+ROI_BOTTOM        = 1.00   # keep everything down to the bottom edge
+
+# ── Auto-mode settings ─────────────────────────────────────
+# Seconds between consecutive auto-trigger cycles (lockout).
+AUTO_LOCKOUT_S    = 8.0
+# Minimum frames an object must be seen consecutively before
+# triggering action — reduces false-positive single-frame hits.
+DETECTION_CONFIRM = 3
+
+# ── Beep settings ───────────────────────────────────────────
+# Uses the PC speaker via 'beepy' if installed, else silent.
+# pip install beepy
+BEEP_ACCEPT_COUNT = 1    # beeps for accepted/pick object
+BEEP_REJECT_COUNT = 3    # beeps for wrong/reject object
+
+# ── Home position (persisted to HOME_POS_FILE) ──────────────
+_DEFAULT_HOME = {"base": 90, "shoulder": 90, "elbow": 45, "gripper": 30}
+
+# ── derived URLs ──
+STREAM_URL = f"http://{ESP32_IP}/mjpeg"
+MOVE_URL   = f"http://{ESP32_IP}/move"
+HOME_URL   = f"http://{ESP32_IP}/home"
+STATUS_URL = f"http://{ESP32_IP}/status"
+
+# ── portable data directory (same folder as this script) ──
+DATA_DIR         = os.path.dirname(os.path.abspath(__file__))
+TRAINING_FILE    = os.path.join(DATA_DIR, "trained_objects.json")
+RECORDINGS_FILE  = os.path.join(DATA_DIR, "recordings.json")
+PICK_RULES_FILE  = os.path.join(DATA_DIR, "pick_rules.json")
+HOME_POS_FILE    = os.path.join(DATA_DIR, "home_position.json")
+
+# ══════════════════════════════════════════════════════════════
+#  DATA LAYER  — load / save helpers
+# ══════════════════════════════════════════════════════════════
+def _load(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[DATA] load {path}: {e}")
+    return default
+
+def _save(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[DATA] save {path}: {e}")
+
+trained_objects = _load(TRAINING_FILE,   [])
+recordings      = _load(RECORDINGS_FILE, [])
+pick_rules      = _load(PICK_RULES_FILE, [])
+
+# ══════════════════════════════════════════════════════════════
+#  GLOBAL STATE
+# ══════════════════════════════════════════════════════════════
+edge_enabled      = True
+auto_detect       = False
+last_detected     = []
+frame_lock        = threading.Lock()
+playback_status   = {"running": False, "name": "", "step": 0, "total": 0}
+record_session    = {"active": False, "steps": [], "pending": None}
+
+# ── Home position ─────────────────────────────────────────
+home_position = _load(HOME_POS_FILE, dict(_DEFAULT_HOME))
+
+# ── Auto-mode lockout + detection confirmer ──────────────
+_auto_lock        = threading.Lock()
+_auto_busy        = False           # True while a cycle is running
+_no_rule_prompt   = set()           # objects seen with no recording/rule
+last_auto_action  = "IDLE"          # reported in /api/status
+_confirm_counts   = {}              # {obj_name: consecutive_frame_count}
+
+# ══════════════════════════════════════════════════════════════
+#  COLOUR / SHAPE HELPERS
+# ══════════════════════════════════════════════════════════════
+def hue_to_name(h_cv):
+    d = h_cv * 2
+    if d < 15 or d >= 345: return "Red"
+    if d < 35:  return "Orange"
+    if d < 75:  return "Yellow"
+    if d < 160: return "Green"
+    if d < 200: return "Cyan"
+    if d < 260: return "Blue"
+    if d < 290: return "Purple"
+    if d < 330: return "Pink"
+    return "Red"
+
+def dominant_color_name(mask, hsv_frame):
+    px = hsv_frame[mask > 0]
+    if not len(px): return "Unknown"
+    s, v = np.mean(px[:,1]), np.mean(px[:,2])
+    if s < 40:
+        return "White" if v > 200 else ("Black" if v < 60 else "Gray")
+    return hue_to_name(np.mean(px[:,0]))
+
+def detect_shape(contour):
+    peri   = cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+    n = len(approx)
+    if n == 3: return "Triangle"
+    if n == 4:
+        x, y, w, h = cv2.boundingRect(approx)
+        return "Square" if 0.85 <= w/float(h) <= 1.15 else "Rectangle"
+    if n >= 6:
+        try:
+            _, (MA, mi), _ = cv2.fitEllipse(contour)
+            return "Circle" if MA / max(mi, 1) < 1.3 else "Ellipse"
+        except: return "Circle"
+    return "Shape"
+
+# ══════════════════════════════════════════════════════════════
+#  SERVO HELPERS  — sequenced gripper delay built in
+# ══════════════════════════════════════════════════════════════
+def esp_raw(**kw):
+    """Send axes directly to ESP32, no sequencing."""
+    try:
+        r = requests.post(MOVE_URL, json=kw, timeout=2)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"[MOVE] {e}"); return False
+
+def esp_home():
+    """Sync home_position to ESP32 then trigger /home."""
+    try:
+        requests.post(f"http://{ESP32_IP}/set_home", json=home_position, timeout=2)
+        r = requests.post(HOME_URL, timeout=2)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"[HOME] {e}"); return False
+
+def _find_recording_by_name(name):
+    """Find a recording whose name matches (case-insensitive)."""
+    name_l = name.strip().lower()
+    return next((r for r in recordings if r["name"].strip().lower() == name_l), None)
+
+def esp_status():
+    try:
+        r = requests.get(STATUS_URL, timeout=1.5)
+        return r.json() if r.status_code == 200 else {}
+    except: return {}
+
+def _axes_settled(axes_to_check=("base","shoulder","elbow")):
+    """Poll /status until the given axes are within DONE_THRESHOLD of target."""
+    for _ in range(120):          # up to 12 s
+        st = esp_status()
+        if all(
+            abs(st.get(a, {}).get("current", 0) - st.get(a, {}).get("target", 0))
+            <= DONE_THRESHOLD
+            for a in axes_to_check
+            if a in st
+        ):
+            return
+        time.sleep(0.1)
+
+def esp_move_seq(base=None, shoulder=None, elbow=None, gripper=None):
+    """
+    Move arm axes first (base/shoulder/elbow), wait until they settle
+    (or GRIPPER_DELAY_SEC, whichever is longer), then move gripper.
+    All parameters are optional.
+    """
+    arm_cmd  = {k: v for k, v in dict(base=base, shoulder=shoulder, elbow=elbow).items() if v is not None}
+    grip_cmd = {"gripper": gripper} if gripper is not None else {}
+
+    if arm_cmd:
+        esp_raw(**arm_cmd)
+        # Wait for physical movement AND minimum delay
+        t0 = time.time()
+        _axes_settled(list(arm_cmd.keys()))
+        elapsed = time.time() - t0
+        remaining = GRIPPER_DELAY_SEC - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    if grip_cmd:
+        esp_raw(**grip_cmd)
+
+
+# ══════════════════════════════════════════════════════════════
+#  RECORDING ENGINE
+# ══════════════════════════════════════════════════════════════
+def _find_recording(rec_id):
+    return next((r for r in recordings if r["id"] == rec_id), None)
+
+def play_recording(rec_id):
+    rec = _find_recording(rec_id)
+    if not rec or playback_status["running"]:
+        return False
+
+    def _run():
+        playback_status.update(running=True, name=rec["name"],
+                               step=0, total=len(rec["steps"]))
+        for i, step in enumerate(rec["steps"]):
+            playback_status["step"] = i + 1
+            # Honour gripper-delay sequencing per step
+            esp_move_seq(
+                base     = step.get("base"),
+                shoulder = step.get("shoulder"),
+                elbow    = step.get("elbow"),
+                gripper  = step.get("gripper"),
+            )
+            hold = step.get("hold", 0.5)
+            time.sleep(hold)
+        playback_status.update(running=False, name="", step=0, total=0)
+        # Always return to home after any recording finishes
+        esp_home()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+# ══════════════════════════════════════════════════════════════
+#  PICK-RULE ENGINE
+# ══════════════════════════════════════════════════════════════
+def execute_pick_rule(obj_name):
+    """
+    Execute a full pick-and-place cycle SYNCHRONOUSLY.
+    Caller is responsible for threading and lockout.
+    """
+    rule = next((r for r in pick_rules if r["object_name"] == obj_name), None)
+    if not rule:
+        print(f"[PICK] No rule for '{obj_name}'"); return
+    esp_move_seq(base=rule.get("approach_base", 90),
+                 shoulder=rule.get("approach_shoulder", 110),
+                 elbow=rule.get("approach_elbow", 80))
+    esp_move_seq(gripper=rule.get("grip_open", 30))
+    time.sleep(0.3)
+    esp_move_seq(shoulder=rule.get("grip_shoulder", 120))
+    esp_move_seq(gripper=rule.get("grip_close", 0))
+    esp_move_seq(shoulder=rule.get("lift_shoulder", 90))
+    esp_move_seq(base=rule.get("drop_base", 0))
+    time.sleep(rule.get("drop_hold", 0.3))
+    esp_move_seq(shoulder=rule.get("drop_shoulder", 110),
+                 elbow=rule.get("drop_elbow", 80))
+    esp_move_seq(gripper=rule.get("drop_open", 20))
+    time.sleep(0.5)
+    esp_home()
+
+
+# ══════════════════════════════════════════════════════════════
+#  AUTO-MODE CYCLE ENGINE
+#  Logic per detected object:
+#   1. Require DETECTION_CONFIRM consecutive frames (debounce).
+#   2. If arm busy → skip.
+#   3. Look for a recording named after the object (accepted).
+#      Look for a recording named "wrong" (for unknowns/rejects).
+#   4. Play that recording (blocks further detection via _auto_busy).
+#   5. After recording + home return, release lockout.
+#   6. Beep: 1× for accepted, 3× for wrong.
+# ══════════════════════════════════════════════════════════════
+def _auto_cycle(obj_name, accepted):
+    """Run in a daemon thread. Owns the _auto_busy lock for its duration."""
+    global _auto_busy, last_auto_action
+    try:
+        if accepted:
+            rec = _find_recording_by_name(obj_name)
+            if rec:
+                last_auto_action = f"PICK:{obj_name}"
+                threading.Thread(target=_beep, args=(BEEP_ACCEPT_COUNT,), daemon=True).start()
+                play_recording(rec["id"])           # starts its own thread + home return
+                # Wait for playback to finish before releasing lockout
+                while playback_status["running"]:
+                    time.sleep(0.2)
+            else:
+                # No recording — fall back to pick rule if defined
+                rule = next((r for r in pick_rules if r["object_name"] == obj_name), None)
+                if rule:
+                    last_auto_action = f"RULE:{obj_name}"
+                    threading.Thread(target=_beep, args=(BEEP_ACCEPT_COUNT,), daemon=True).start()
+                    execute_pick_rule(obj_name)     # synchronous, already homes
+                else:
+                    _no_rule_prompt.add(obj_name)
+                    last_auto_action = f"NO_ACTION:{obj_name}"
+        else:
+            # Wrong/unknown object
+            rec = _find_recording_by_name("wrong")
+            last_auto_action = f"REJECT:{obj_name}"
+            threading.Thread(target=_beep, args=(BEEP_REJECT_COUNT,), daemon=True).start()
+            if rec:
+                play_recording(rec["id"])
+                while playback_status["running"]:
+                    time.sleep(0.2)
+            else:
+                # No "wrong" recording — just home
+                esp_home()
+        # Lockout cooldown after action completes
+        time.sleep(AUTO_LOCKOUT_S)
+    finally:
+        with _auto_lock:
+            _auto_busy = False
+        last_auto_action = "IDLE"
+
+
+def _auto_trigger(obj_name, accepted):
+    """
+    Called from process_frame for every confirmed detection.
+    Enforces consecutive-frame debounce and lockout.
+    """
+    global _auto_busy, _confirm_counts
+    # Increment consecutive frame counter for this object
+    _confirm_counts[obj_name] = _confirm_counts.get(obj_name, 0) + 1
+    if _confirm_counts[obj_name] < DETECTION_CONFIRM:
+        return   # not confirmed yet
+    with _auto_lock:
+        if _auto_busy:
+            return
+        _auto_busy = True
+        _confirm_counts.clear()   # reset all counters once a cycle starts
+    threading.Thread(target=_auto_cycle, args=(obj_name, accepted), daemon=True).start()
+
+# ══════════════════════════════════════════════════════════════
+#  FRAME PROCESSING
+# ══════════════════════════════════════════════════════════════
+def _suppress_reflections(mask, hsv_frame):
+    """
+    Remove likely specular reflections from a colour mask.
+    Reflections appear as very high-V, very low-S pixels.
+    We erode the mask edges (reflections sit on bright edges)
+    and exclude pixels where S<30 AND V>220 (near-white glare).
+    """
+    # Build a glare exclusion mask
+    glare = cv2.inRange(hsv_frame,
+                        np.array([0,  0, 220], np.uint8),
+                        np.array([179,40, 255], np.uint8))
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(glare))
+    # Light erosion to trim bright edge halos
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask   = cv2.erode(mask, kernel, iterations=1)
+    mask   = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+
+def _in_roi(cy, h):
+    """Return True if the centroid's Y position is inside the working ROI."""
+    return (h * ROI_TOP) <= cy <= (h * ROI_BOTTOM)
+
+def _solidity(cnt):
+    """Solidity = contour area / convex hull area.  Rejects thin/noisy blobs."""
+    hull_area = cv2.contourArea(cv2.convexHull(cnt))
+    if hull_area == 0:
+        return 0.0
+    return cv2.contourArea(cnt) / hull_area
+
+def process_frame(frame):
+    global last_detected, _confirm_counts
+    if frame is None: return None
+
+    output = frame.copy()
+    h, w   = frame.shape[:2]
+    hsv    = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    detections    = []
+    labeled_masks = []
+    seen_names    = set()   # track which objects appeared this frame
+
+    # ── Draw ROI boundary on output (visual feedback) ──
+    roi_y_top    = int(h * ROI_TOP)
+    roi_y_bottom = int(h * ROI_BOTTOM)
+    if ROI_TOP > 0.0 or ROI_BOTTOM < 1.0:
+        cv2.line(output, (0, roi_y_top),    (w, roi_y_top),    (60, 60, 200), 1)
+        cv2.line(output, (0, roi_y_bottom), (w, roi_y_bottom), (60, 60, 200), 1)
+        cv2.putText(output, "ROI", (4, roi_y_top - 4),
+                    cv2.FONT_HERSHEY_PLAIN, 0.8, (60, 60, 200), 1, cv2.LINE_AA)
+
+    # ── trained objects ──
+    for obj in trained_objects:
+        lo = np.array(obj["color_lower"], np.uint8)
+        hi = np.array(obj["color_upper"], np.uint8)
+        if lo[0] > hi[0]:
+            m1 = cv2.inRange(hsv, np.array([lo[0],lo[1],lo[2]]), np.array([179,hi[1],hi[2]]))
+            m2 = cv2.inRange(hsv, np.array([0,lo[1],lo[2]]), hi)
+            mask = cv2.bitwise_or(m1, m2)
+        else:
+            mask = cv2.inRange(hsv, lo, hi)
+        k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(7,7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        # ── reflection suppression ──
+        mask = _suppress_reflections(mask, hsv)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+
+            # ── FILTER 1: minimum size — rejects distant/tiny objects ──
+            if area < MIN_OBJECT_AREA:
+                continue
+
+            # ── FILTER 2: solidity — rejects noisy/fragmented blobs ──
+            if _solidity(cnt) < MIN_SOLIDITY:
+                continue
+
+            shape = detect_shape(cnt)
+            if obj["shape"].lower() not in ("any", shape.lower()): continue
+
+            M = cv2.moments(cnt)
+            if M["m00"] == 0: continue
+            cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
+
+            # ── FILTER 3: ROI — rejects objects outside working zone ──
+            if not _in_roi(cy, h):
+                continue
+
+            conf  = min(area / 5000 * 100, 99.9)
+
+            # ── FILTER 4: minimum confidence ──
+            if conf < MIN_CONFIDENCE:
+                continue
+
+            cname = dominant_color_name(mask, hsv)
+            # Determine if this is an accepted (has recording/rule) object
+            has_rec  = _find_recording_by_name(obj["name"]) is not None
+            has_rule = any(r["object_name"] == obj["name"] for r in pick_rules)
+            accepted = has_rec or has_rule
+            col      = (0,220,80) if accepted else (0,100,255)
+            detections.append({"name":obj["name"],"color":cname,"shape":shape,
+                                "center":(cx,cy),"confidence":conf,
+                                "accepted":accepted})
+            labeled_masks.append(mask)
+            seen_names.add(obj["name"])
+            x2,y2,bw,bh = cv2.boundingRect(cnt)
+            cv2.drawContours(output,[cnt],-1,col,2)
+            cv2.rectangle(output,(x2,y2),(x2+bw,y2+bh),col,1)
+            status_tag = "ACCEPT" if accepted else "REJECT"
+            _draw_label(output, obj["name"],
+                        f"{cname} {shape}  {conf:.0f}%  [{status_tag}]",
+                        (cx,cy), col)
+            # ── auto trigger ──
+            if auto_detect:
+                _auto_trigger(obj["name"], accepted)
+
+    # ── unknowns ──
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray,(7,7),0)
+    _, thresh = cv2.threshold(blurred,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    combined  = np.zeros((h,w),np.uint8)
+    for lm in labeled_masks: combined = cv2.bitwise_or(combined,lm)
+    un_cnts,_ = cv2.findContours(thresh,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in un_cnts:
+        area = cv2.contourArea(cnt)
+        # ── FILTER 1: size (larger threshold than trained objects) ──
+        if area < MIN_UNKNOWN_AREA or area > h*w*0.6: continue
+        # ── FILTER 2: solidity ──
+        if _solidity(cnt) < MIN_SOLIDITY: continue
+        x2,y2,bw,bh = cv2.boundingRect(cnt)
+        if combined[y2:y2+bh,x2:x2+bw].mean() > 20: continue
+        M = cv2.moments(cnt)
+        if M["m00"]==0: continue
+        cx=int(M["m10"]/M["m00"]); cy=int(M["m01"]/M["m00"])
+        # ── FILTER 3: ROI ──
+        if not _in_roi(cy, h): continue
+        om = np.zeros((h,w),np.uint8); cv2.drawContours(om,[cnt],-1,255,-1)
+        cname = dominant_color_name(om,hsv)
+        shape = detect_shape(cnt)
+        cv2.drawContours(output,[cnt],-1,(0,80,220),2)
+        cv2.rectangle(output,(x2,y2),(x2+bw,y2+bh),(0,80,220),1)
+        _draw_label(output,"Unknown",f"{cname} {shape}  [UNKNOWN]",(cx,cy),(0,80,220))
+        if auto_detect:
+            _auto_trigger("unknown", False)
+
+    # ── edge overlay ──
+    if edge_enabled:
+        edges = cv2.Canny(gray,40,120)
+        output = cv2.addWeighted(output,0.82,cv2.cvtColor(edges,cv2.COLOR_GRAY2BGR),0.18,0)
+
+    # ── NO HUD BAR — clean stream ──
+    # Reset confirm counters for objects not seen this frame
+    for name in list(_confirm_counts.keys()):
+        if name not in seen_names:
+            _confirm_counts.pop(name, None)
+
+    with frame_lock:
+        last_detected = [
+            {"name":d["name"],"color":d["color"],"shape":d["shape"],
+             "confidence":round(d["confidence"],1),"accepted":d["accepted"]}
+            for d in detections
+        ]
+    return output
+
+def _draw_label(img, title, subtitle, center, color):
+    cx,cy = center
+    font  = cv2.FONT_HERSHEY_DUPLEX
+    t1w = cv2.getTextSize(title,   font,0.55,1)[0][0]
+    t2w = cv2.getTextSize(subtitle,font,0.40,1)[0][0]
+    bw,bh = max(t1w,t2w)+16, 36
+    x0,y0 = cx-bw//2, cy-58
+    ov = img.copy()
+    cv2.rectangle(ov,(x0,y0),(x0+bw,y0+bh),(10,10,20),-1)
+    cv2.addWeighted(ov,0.6,img,0.4,0,img)
+    cv2.putText(img,title,   (x0+8,y0+14),font,0.55,color,          1,cv2.LINE_AA)
+    cv2.putText(img,subtitle,(x0+8,y0+28),font,0.40,(200,200,200),1,cv2.LINE_AA)
+    cv2.circle(img,(cx,cy),5,color,-1)
+    cv2.line(img,(cx,cy),(cx,cy-18),color,1)
+
+# ══════════════════════════════════════════════════════════════
+#  STREAM
+# ══════════════════════════════════════════════════════════════
+def generate_stream():
+    session = requests.Session()
+    while True:
+        try:
+            resp = session.get(STREAM_URL, stream=True, timeout=6)
+            resp.raise_for_status()
+            buf = b""
+            for chunk in resp.iter_content(chunk_size=4096):
+                if not chunk: continue
+                buf += chunk
+                a = buf.find(b'\xff\xd8'); b_ = buf.find(b'\xff\xd9')
+                if a != -1 and b_ != -1:
+                    jpg = buf[a:b_+2]; buf = buf[b_+2:]
+                    frame = cv2.imdecode(np.frombuffer(jpg,np.uint8), cv2.IMREAD_COLOR)
+                    if frame is None: continue
+                    frame = cv2.flip(frame, 0)  # OV3660 vertical flip
+                    out = process_frame(frame)
+                    if out is None: continue
+                    _, enc = cv2.imencode('.jpg', out, [cv2.IMWRITE_JPEG_QUALITY,80])
+                    yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + enc.tobytes() + b'\r\n'
+        except Exception as e:
+            print(f"[STREAM] {e} — retry in 2s"); time.sleep(2)
+
+# ══════════════════════════════════════════════════════════════
+#  FLASK APP
+# ══════════════════════════════════════════════════════════════
+app = Flask(__name__)
+CORS(app)
+
+@app.route("/")
+def index(): return HTML_TEMPLATE
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ── servo ──
+@app.route("/api/servo", methods=["POST"])
+def api_servo():
+    d   = request.json or {}
+    cmd = {k:int(v) for k,v in d.items() if k in ("base","shoulder","elbow","gripper") and v is not None}
+    def _send():
+        esp_move_seq(
+            base     = cmd.get("base"),
+            shoulder = cmd.get("shoulder"),
+            elbow    = cmd.get("elbow"),
+            gripper  = cmd.get("gripper"),
+        )
+    threading.Thread(target=_send, daemon=True).start()
+    return jsonify({"status":"ok","sent":cmd,"gripper_delay":GRIPPER_DELAY_SEC})
+
+@app.route("/api/home", methods=["POST"])
+def api_home():
+    threading.Thread(target=esp_home, daemon=True).start()
+    return jsonify({"status":"ok","home_position":dict(home_position)})
+
+# ── Home position endpoints ──────────────────────────────
+@app.route("/api/home_pos", methods=["GET"])
+def api_home_pos_get():
+    return jsonify(home_position)
+
+@app.route("/api/home_pos/set", methods=["POST"])
+def api_home_pos_set():
+    global home_position
+    d = request.json or {}
+    limits = {"base":(0,180),"shoulder":(45,135),"elbow":(10,120),"gripper":(0,40)}
+    for ax,(lo,hi) in limits.items():
+        if ax in d:
+            home_position[ax] = max(lo, min(hi, int(d[ax])))
+    _save(HOME_POS_FILE, home_position)
+    try: requests.post(f"http://{ESP32_IP}/set_home", json=home_position, timeout=2)
+    except: pass
+    return jsonify({"status":"ok","home_position":dict(home_position)})
+
+@app.route("/api/home_pos/use_current", methods=["POST"])
+def api_home_pos_use_current():
+    global home_position
+    st = esp_status()
+    if not st: return jsonify({"error":"ESP32 unreachable"}), 503
+    limits = {"base":(0,180),"shoulder":(45,135),"elbow":(10,120),"gripper":(0,40)}
+    for ax,(lo,hi) in limits.items():
+        if ax in st:
+            home_position[ax] = max(lo, min(hi, int(st[ax].get("current", home_position[ax]))))
+    _save(HOME_POS_FILE, home_position)
+    try: requests.post(f"http://{ESP32_IP}/set_home", json=home_position, timeout=2)
+    except: pass
+    return jsonify({"status":"ok","home_position":dict(home_position)})
+
+@app.route("/api/auto/dismiss_prompt", methods=["POST"])
+def api_dismiss_prompt():
+    name = (request.json or {}).get("name","")
+    _no_rule_prompt.discard(name)
+    return jsonify({"status":"ok"})
+
+@app.route("/api/preset", methods=["POST"])
+def api_preset():
+    presets = {
+        "home":  dict(**home_position),
+        "pick":  dict(base=90,shoulder=110,elbow=80,gripper=10),
+        "place": dict(base=60,shoulder=105,elbow=75,gripper=30),
+    }
+    p = presets.get((request.json or {}).get("name","home"), presets["home"])
+    threading.Thread(target=esp_move_seq, kwargs=p, daemon=True).start()
+    return jsonify({"status":"ok"})
+
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    with frame_lock: det = list(last_detected)
+    return jsonify({
+        "servo_status":    esp_status(),
+        "detections":      det,
+        "playback":        dict(playback_status),
+        "recording":       {"active": record_session["active"],
+                            "steps":  len(record_session["steps"])},
+        "gripper_delay":   GRIPPER_DELAY_SEC,
+        "auto_action":     last_auto_action,
+        "no_rule_prompt":  list(_no_rule_prompt),
+        "home_position":   dict(home_position),
+    })
+
+# ── vision toggles ──
+@app.route("/api/toggle_edge", methods=["POST"])
+def api_toggle_edge():
+    global edge_enabled
+    edge_enabled = bool((request.json or {}).get("enabled", not edge_enabled))
+    return jsonify({"edge_enabled": edge_enabled})
+
+@app.route("/api/toggle_auto", methods=["POST"])
+def api_toggle_auto():
+    global auto_detect
+    auto_detect = bool((request.json or {}).get("enabled", not auto_detect))
+    return jsonify({"auto_detect": auto_detect})
+
+# ── training ──
+@app.route("/api/train", methods=["POST"])
+def api_train():
+    d = request.json or {}
+    if not {"name","shape","color_lower","color_upper"}.issubset(d):
+        return jsonify({"error":"missing fields"}), 400
+    lo,hi = d["color_lower"], d["color_upper"]
+    obj = {
+        "name":        d["name"].strip(),
+        "color":       hue_to_name((lo[0]+hi[0])/2),
+        "shape":       d["shape"],
+        "color_lower": [int(x) for x in lo],
+        "color_upper": [int(x) for x in hi],
+        "added":       time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    trained_objects.append(obj)
+    _save(TRAINING_FILE, trained_objects)
+    return jsonify({"status":"trained","object":obj,"total":len(trained_objects)})
+
+@app.route("/api/objects", methods=["GET"])
+def api_objects():
+    return jsonify(trained_objects)
+
+@app.route("/api/delete_object", methods=["POST"])
+def api_delete_object():
+    idx = (request.json or {}).get("index",-1)
+    if 0 <= idx < len(trained_objects):
+        r = trained_objects.pop(idx)
+        _save(TRAINING_FILE, trained_objects)
+        return jsonify({"status":"deleted","name":r["name"]})
+    return jsonify({"error":"invalid index"}), 400
+
+# ══════════════════════════════════════════════════════════════
+#  RECORDINGS API
+# ══════════════════════════════════════════════════════════════
+@app.route("/api/recordings", methods=["GET"])
+def api_recordings():
+    return jsonify([{k:v for k,v in r.items() if k!="steps"} for r in recordings] +
+                   [{"_steps_omitted":True}])
+
+@app.route("/api/recordings/list", methods=["GET"])
+def api_recordings_list():
+    return jsonify([{"id":r["id"],"name":r["name"],
+                     "steps":len(r["steps"]),"created":r.get("created","")}
+                    for r in recordings])
+
+@app.route("/api/recordings/get/<rec_id>", methods=["GET"])
+def api_recording_get(rec_id):
+    rec = _find_recording(rec_id)
+    return jsonify(rec) if rec else (jsonify({"error":"not found"}),404)
+
+@app.route("/api/recordings/save", methods=["POST"])
+def api_recordings_save():
+    """Save or update a recording. Body: {id?, name, steps:[{base,shoulder,elbow,gripper,hold}]}"""
+    d = request.json or {}
+    if not d.get("name") or not isinstance(d.get("steps"), list):
+        return jsonify({"error":"name and steps required"}), 400
+    rec_id = d.get("id") or f"rec_{int(time.time()*1000)}"
+    existing = _find_recording(rec_id)
+    rec = {
+        "id":      rec_id,
+        "name":    d["name"].strip(),
+        "steps":   d["steps"],
+        "created": existing.get("created", time.strftime("%Y-%m-%d %H:%M:%S")) if existing else time.strftime("%Y-%m-%d %H:%M:%S"),
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if existing:
+        recordings[recordings.index(existing)] = rec
+    else:
+        recordings.append(rec)
+    _save(RECORDINGS_FILE, recordings)
+    return jsonify({"status":"saved","id":rec_id,"name":rec["name"],"steps":len(rec["steps"])})
+
+@app.route("/api/recordings/rename", methods=["POST"])
+def api_recordings_rename():
+    d   = request.json or {}
+    rec = _find_recording(d.get("id",""))
+    if not rec: return jsonify({"error":"not found"}),404
+    rec["name"] = d.get("name","").strip() or rec["name"]
+    _save(RECORDINGS_FILE, recordings)
+    return jsonify({"status":"renamed","name":rec["name"]})
+
+@app.route("/api/recordings/delete", methods=["POST"])
+def api_recordings_delete():
+    rec_id = (request.json or {}).get("id","")
+    rec    = _find_recording(rec_id)
+    if not rec: return jsonify({"error":"not found"}),404
+    recordings.remove(rec)
+    _save(RECORDINGS_FILE, recordings)
+    return jsonify({"status":"deleted","name":rec["name"]})
+
+@app.route("/api/recordings/play", methods=["POST"])
+def api_recordings_play():
+    rec_id = (request.json or {}).get("id","")
+    ok = play_recording(rec_id)
+    return jsonify({"status":"playing" if ok else "error"})
+
+@app.route("/api/recordings/stop", methods=["POST"])
+def api_recordings_stop():
+    playback_status["running"] = False
+    return jsonify({"status":"stopped"})
+
+# Recording session (step-by-step capture from the UI)
+@app.route("/api/record/start", methods=["POST"])
+def api_record_start():
+    record_session.update(active=True, steps=[], pending=None)
+    return jsonify({"status":"recording_started"})
+
+@app.route("/api/record/capture", methods=["POST"])
+def api_record_capture():
+    """Capture current servo positions as a new step. Body: {positions:{...}, hold:0.5}"""
+    if not record_session["active"]:
+        return jsonify({"error":"no active recording"}),400
+    d    = request.json or {}
+    pos  = d.get("positions", {})
+    hold = float(d.get("hold", 0.5))
+    step = {k:int(v) for k,v in pos.items() if k in ("base","shoulder","elbow","gripper") and v is not None}
+    step["hold"] = hold
+    record_session["steps"].append(step)
+    return jsonify({"status":"captured","step":len(record_session["steps"]),"data":step})
+
+@app.route("/api/record/discard_last", methods=["POST"])
+def api_record_discard():
+    if record_session["steps"]:
+        record_session["steps"].pop()
+    return jsonify({"status":"ok","remaining":len(record_session["steps"])})
+
+@app.route("/api/record/finish", methods=["POST"])
+def api_record_finish():
+    """Finish and save recording. Body: {name}"""
+    d    = request.json or {}
+    name = d.get("name","").strip() or f"Recording {len(recordings)+1}"
+    if not record_session["steps"]:
+        return jsonify({"error":"no steps recorded"}),400
+    rec_id = f"rec_{int(time.time()*1000)}"
+    rec = {"id":rec_id,"name":name,"steps":list(record_session["steps"]),
+           "created":time.strftime("%Y-%m-%d %H:%M:%S")}
+    recordings.append(rec)
+    _save(RECORDINGS_FILE, recordings)
+    record_session.update(active=False, steps=[], pending=None)
+    return jsonify({"status":"saved","id":rec_id,"name":name,"steps":len(rec["steps"])})
+
+@app.route("/api/record/cancel", methods=["POST"])
+def api_record_cancel():
+    record_session.update(active=False, steps=[], pending=None)
+    return jsonify({"status":"cancelled"})
+
+# ══════════════════════════════════════════════════════════════
+#  PICK RULES API
+# ══════════════════════════════════════════════════════════════
+@app.route("/api/pick_rules", methods=["GET"])
+def api_pick_rules():
+    return jsonify(pick_rules)
+
+@app.route("/api/pick_rules/save", methods=["POST"])
+def api_pick_rules_save():
+    d = request.json or {}
+    if not d.get("object_name"):
+        return jsonify({"error":"object_name required"}),400
+    existing = next((r for r in pick_rules if r["object_name"]==d["object_name"]), None)
+    rule = {
+        "object_name":        d["object_name"],
+        "approach_base":      int(d.get("approach_base",90)),
+        "approach_shoulder":  int(d.get("approach_shoulder",110)),
+        "approach_elbow":     int(d.get("approach_elbow",80)),
+        "grip_open":          int(d.get("grip_open",30)),
+        "grip_shoulder":      int(d.get("grip_shoulder",120)),
+        "grip_close":         int(d.get("grip_close",0)),
+        "lift_shoulder":      int(d.get("lift_shoulder",90)),
+        "drop_base":          int(d.get("drop_base",0)),
+        "drop_shoulder":      int(d.get("drop_shoulder",110)),
+        "drop_elbow":         int(d.get("drop_elbow",80)),
+        "drop_open":          int(d.get("drop_open",30)),
+        "drop_hold":          float(d.get("drop_hold",0.3)),
+        "updated":            time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if existing:
+        pick_rules[pick_rules.index(existing)] = rule
+    else:
+        pick_rules.append(rule)
+    _save(PICK_RULES_FILE, pick_rules)
+    return jsonify({"status":"saved","rule":rule})
+
+@app.route("/api/pick_rules/delete", methods=["POST"])
+def api_pick_rules_delete():
+    name = (request.json or {}).get("object_name","")
+    r = next((x for x in pick_rules if x["object_name"]==name), None)
+    if not r: return jsonify({"error":"not found"}),404
+    pick_rules.remove(r)
+    _save(PICK_RULES_FILE, pick_rules)
+    return jsonify({"status":"deleted"})
+
+@app.route("/api/pick_rules/run", methods=["POST"])
+def api_pick_rules_run():
+    name = (request.json or {}).get("object_name","")
+    threading.Thread(target=execute_pick_rule, args=(name,), daemon=True).start()
+    return jsonify({"status":"running","object_name":name})
+
+# ══════════════════════════════════════════════════════════════
+#  HTML / JS / CSS — single-file web app
+# ══════════════════════════════════════════════════════════════
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Robotic Arm — Vision System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink0:#09090f;--ink1:#0f1120;--ink2:#141828;--ink3:#1a2035;--ink4:#202844;--ink5:#2b3555;
+  --rim:#ffffff0c;--rim2:#ffffff14;--rim3:#ffffff20;
+  --tx0:#edf2ff;--tx1:#a0b4d8;--tx2:#566a90;--tx3:#2e3f60;
+  --cy:#00d4ff;--cy2:#0099cc;--cy-a:rgba(0,212,255,.12);
+  --gn:#00e888;--gn2:#00a860;--gn-a:rgba(0,232,136,.10);
+  --rd:#ff3c58;--rd2:#cc1a38;--rd-a:rgba(255,60,88,.10);
+  --yw:#ffbb00;--yw2:#cc8800;--yw-a:rgba(255,187,0,.10);
+  --pu:#9b72ff;--pu-a:rgba(155,114,255,.12);
+  --or:#ff7c30;--or-a:rgba(255,124,48,.10);
+  --ff:'Inter',system-ui,sans-serif;
+  --fm:'JetBrains Mono',monospace;
+  --r:10px;--r2:6px;--gap:8px;
+}
+html,body{height:100%;overflow:hidden;background:var(--ink0);color:var(--tx0);font-family:var(--ff);font-size:13px;line-height:1.5}
+
+/* ── SHELL ── */
+.shell{display:flex;flex-direction:column;height:100%;overflow:hidden}
+
+/* ── TOPBAR ── */
+.topbar{
+  display:flex;align-items:center;gap:10px;padding:0 14px;
+  height:42px;flex-shrink:0;
+  background:var(--ink1);border-bottom:1px solid var(--rim2);
+}
+.logo{font-family:var(--fm);font-size:11px;font-weight:500;letter-spacing:.12em;color:var(--cy);white-space:nowrap}
+.logo em{color:var(--tx2);font-style:normal}
+.tbr-gap{flex:1}
+.chip{
+  display:inline-flex;align-items:center;gap:5px;
+  font-family:var(--fm);font-size:10px;font-weight:500;letter-spacing:.07em;
+  padding:3px 9px;border-radius:20px;border:1px solid var(--rim2);
+  color:var(--tx2);background:var(--ink2);white-space:nowrap;cursor:pointer;transition:.2s;
+}
+.chip .dot{width:5px;height:5px;border-radius:50%;background:var(--tx3);flex-shrink:0;transition:.3s}
+.chip.on    {border-color:var(--cy2);color:var(--cy); background:var(--cy-a)} .chip.on   .dot{background:var(--cy);box-shadow:0 0 5px var(--cy)}
+.chip.live  {border-color:var(--gn2);color:var(--gn); background:var(--gn-a)} .chip.live .dot{background:var(--gn);box-shadow:0 0 5px var(--gn)}
+.chip.warn  {border-color:var(--rd2);color:var(--rd); background:var(--rd-a)} .chip.warn .dot{background:var(--rd);box-shadow:0 0 5px var(--rd)}
+.chip.play  {border-color:var(--or);color:var(--or);  background:var(--or-a)} .chip.play .dot{background:var(--or);box-shadow:0 0 5px var(--or)}
+.chip.rec   {border-color:var(--rd);color:var(--rd);  background:var(--rd-a);animation:blink 1s step-end infinite} .chip.rec .dot{background:var(--rd)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.45}}
+
+/* ── 3-COL GRID ── */
+.main{
+  display:grid;
+  grid-template-columns:minmax(0,1.9fr) 210px minmax(0,1.3fr);
+  gap:var(--gap);padding:var(--gap);flex:1;overflow:hidden;min-height:0;
+}
+
+/* ── PANEL ── */
+.panel{background:var(--ink1);border:1px solid var(--rim2);border-radius:var(--r);
+  display:flex;flex-direction:column;overflow:hidden;min-height:0}
+.ph{display:flex;align-items:center;justify-content:space-between;
+  padding:7px 11px;border-bottom:1px solid var(--rim);flex-shrink:0}
+.ph-l{display:flex;align-items:center;gap:7px;font-family:var(--fm);font-size:10px;
+  font-weight:500;letter-spacing:.1em;color:var(--tx1);text-transform:uppercase}
+.ph-ico{width:16px;height:16px;border-radius:4px;font-size:9px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.ico-cy{background:var(--cy-a);color:var(--cy)} .ico-gn{background:var(--gn-a);color:var(--gn)}
+.ico-yw{background:var(--yw-a);color:var(--yw)} .ico-rd{background:var(--rd-a);color:var(--rd)}
+.ico-pu{background:var(--pu-a);color:var(--pu)} .ico-or{background:var(--or-a);color:var(--or)}
+.ph-r{font-family:var(--fm);font-size:10px;color:var(--tx2)}
+.pscroll{overflow-y:auto;flex:1;padding:7px}
+.pscroll::-webkit-scrollbar{width:3px}
+.pscroll::-webkit-scrollbar-thumb{background:var(--ink5);border-radius:2px}
+
+/* ── VIDEO ── */
+.col-vid{display:flex;flex-direction:column}
+.vtools{display:flex;align-items:center;gap:5px;padding:5px 9px;border-bottom:1px solid var(--rim);flex-shrink:0;flex-wrap:wrap}
+.vwrap{flex:1;position:relative;background:#000;overflow:hidden;min-height:0}
+.vwrap img{width:100%;height:100%;object-fit:contain;display:block}
+.vhud{position:absolute;bottom:0;left:0;right:0;padding:14px 11px 7px;
+  background:linear-gradient(transparent,rgba(9,9,15,.9));pointer-events:none;
+  display:flex;justify-content:space-between;align-items:flex-end}
+.vhud-l{display:flex;flex-direction:column;gap:2px}
+.vhud-tag{font-family:var(--fm);font-size:10px;color:var(--tx2)}
+.vhud-pb{font-family:var(--fm);font-size:11px;color:var(--or);min-height:14px;letter-spacing:.05em}
+.vhud-t{font-family:var(--fm);font-size:9px;color:var(--tx3)}
+
+/* ICON TOGGLE BTNS */
+.itb{display:inline-flex;align-items:center;gap:5px;font-family:var(--fm);font-size:10px;
+  font-weight:500;letter-spacing:.07em;padding:4px 9px;border-radius:var(--r2);
+  border:1px solid var(--rim2);background:var(--ink2);color:var(--tx2);cursor:pointer;
+  transition:.18s;white-space:nowrap;user-select:none}
+.itb:hover{border-color:var(--rim3);color:var(--tx1);background:var(--ink3)}
+.itb.on {border-color:var(--cy2);color:var(--cy);background:var(--cy-a)}
+.itb.gn {color:var(--gn)}  .itb.gn.on{border-color:var(--gn2);background:var(--gn-a)}
+.itb.rd {color:var(--rd)}  .itb.rd.on{border-color:var(--rd2);background:var(--rd-a)}
+.itb.yw {color:var(--yw)}  .itb.yw.on{border-color:var(--yw2);background:var(--yw-a)}
+.itb.or {color:var(--or)}  .itb.or.on{border-color:var(--or);background:var(--or-a)}
+.itb.pu {color:var(--pu)}  .itb.pu.on{border-color:var(--pu);background:var(--pu-a)}
+.vsep{width:1px;height:16px;background:var(--rim2);flex-shrink:0}
+
+/* ── SERVO ── */
+.col-sv{display:flex;flex-direction:column}
+.sblk{padding:7px 10px;border-bottom:1px solid var(--rim)}
+.sblk:last-of-type{border:none}
+.sh{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+.sl-name{font-family:var(--fm);font-size:10px;font-weight:500;letter-spacing:.08em;text-transform:uppercase}
+.sl-val{font-family:var(--fm);font-size:15px;font-weight:500}
+input[type=range].srv{width:100%;appearance:none;height:3px;border-radius:2px;
+  outline:none;cursor:pointer;background:var(--ink4);margin:0}
+input[type=range].srv::-webkit-slider-thumb{appearance:none;width:13px;height:13px;
+  border-radius:50%;cursor:pointer;border:2px solid var(--ink1);transition:.1s}
+input[type=range].srv:hover::-webkit-slider-thumb{transform:scale(1.2)}
+.slims{display:flex;justify-content:space-between;font-size:9px;color:var(--tx3);margin-top:2px;font-family:var(--fm)}
+.sv-send{width:calc(100% - 20px);margin:6px 10px 0;font-family:var(--fm);font-size:10px;
+  font-weight:500;letter-spacing:.08em;padding:7px;border-radius:var(--r2);
+  border:1px solid var(--cy2);background:var(--cy-a);color:var(--cy);cursor:pointer;transition:.18s}
+.sv-send:hover{background:rgba(0,212,255,.2)}
+.preset-sec{padding:6px 10px;border-top:1px solid var(--rim);flex-shrink:0}
+.ps-lbl{font-family:var(--fm);font-size:9px;color:var(--tx3);text-transform:uppercase;
+  letter-spacing:.1em;margin-bottom:4px}
+.ps-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px}
+.pb{font-family:var(--fm);font-size:10px;font-weight:500;letter-spacing:.06em;
+  padding:5px 4px;border-radius:var(--r2);border:1px solid var(--rim2);
+  background:var(--ink2);color:var(--tx2);cursor:pointer;transition:.18s;text-align:center;text-transform:uppercase}
+.pb:hover{background:var(--ink3);border-color:var(--rim3);color:var(--tx1)}
+.pb.full{grid-column:span 2}
+.pb.home{border-color:rgba(155,114,255,.4);color:var(--pu)}
+.pb.home:hover{background:var(--pu-a)}
+
+/* ── RIGHT COL ── */
+.col-rt{display:grid;grid-template-rows:200px 1fr;gap:var(--gap);min-height:0;overflow:hidden}
+
+/* DETECTION */
+.det-item{display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:var(--r2);
+  border:1px solid var(--rim);background:var(--ink2);margin-bottom:3px;animation:pop .18s}
+.det-item:hover{border-color:var(--rim2);background:var(--ink3)}
+.det-pip{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.det-body{flex:1;min-width:0}
+.det-name{font-weight:500;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.det-meta{font-family:var(--fm);font-size:9px;color:var(--tx2)}
+.det-pct{font-family:var(--fm);font-size:13px;font-weight:500;min-width:30px;text-align:right}
+.det-empty{color:var(--tx3);font-size:11px;padding:14px;text-align:center;font-family:var(--fm)}
+
+/* ── TABS ── */
+.tabs{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+.tab-bar{display:flex;border-bottom:1px solid var(--rim);flex-shrink:0;padding:0 4px}
+.tab-btn{font-family:var(--fm);font-size:10px;font-weight:500;letter-spacing:.07em;
+  padding:7px 10px;border:none;background:transparent;color:var(--tx2);
+  cursor:pointer;border-bottom:2px solid transparent;transition:.18s;text-transform:uppercase;white-space:nowrap}
+.tab-btn:hover{color:var(--tx1)}
+.tab-btn.active{color:var(--cy);border-bottom-color:var(--cy)}
+.tab-pane{display:none;flex:1;overflow:hidden;flex-direction:column;min-height:0}
+.tab-pane.active{display:flex}
+
+/* RECORDING TAB */
+.rec-list{padding:6px}
+.rec-item{display:flex;align-items:center;gap:6px;background:var(--ink2);
+  border:1px solid var(--rim);border-radius:var(--r2);padding:6px 8px;margin-bottom:3px;
+  cursor:pointer;transition:.18s}
+.rec-item:hover{border-color:var(--cy2);background:var(--ink3)}
+.rec-item.playing{border-color:var(--or);background:var(--or-a);animation:blink 1s step-end infinite}
+.rec-ico{width:28px;height:28px;border-radius:5px;background:var(--cy-a);
+  display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0;color:var(--cy)}
+.rec-info{flex:1;min-width:0}
+.rec-name{font-weight:500;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rec-meta{font-family:var(--fm);font-size:9px;color:var(--tx3)}
+.rec-acts{display:flex;gap:3px;flex-shrink:0}
+.rab{font-family:var(--fm);font-size:9px;font-weight:500;padding:3px 6px;border-radius:3px;
+  border:1px solid;cursor:pointer;background:transparent;transition:.15s}
+.rab-pl{border-color:var(--gn2);color:var(--gn)}  .rab-pl:hover{background:var(--gn-a)}
+.rab-ed{border-color:var(--cy2);color:var(--cy)}  .rab-ed:hover{background:var(--cy-a)}
+.rab-rm{border-color:var(--rd2);color:var(--rd)}  .rab-rm:hover{background:var(--rd-a)}
+
+/* Recording session panel */
+.rec-session{background:var(--ink2);border:1px solid var(--rd2);border-radius:var(--r2);
+  padding:8px 10px;margin:6px;animation:borderPulse 1.5s ease-in-out infinite}
+@keyframes borderPulse{0%,100%{border-color:var(--rd2)}50%{border-color:var(--rd)}}
+.rec-sess-hdr{font-family:var(--fm);font-size:10px;font-weight:500;color:var(--rd);
+  letter-spacing:.08em;margin-bottom:6px;display:flex;align-items:center;justify-content:space-between}
+.rec-steps-preview{display:flex;flex-direction:column;gap:2px;max-height:80px;overflow-y:auto;margin-bottom:6px}
+.rec-step-row{font-family:var(--fm);font-size:9px;color:var(--tx2);padding:2px 4px;
+  background:var(--ink3);border-radius:3px;display:flex;justify-content:space-between}
+.rec-sess-btns{display:flex;gap:4px;flex-wrap:wrap}
+
+/* PICK RULES TAB */
+.pr-item{background:var(--ink2);border:1px solid var(--rim);border-radius:var(--r2);
+  padding:7px 9px;margin-bottom:4px}
+.pr-item:hover{border-color:var(--rim2)}
+.pr-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:5px}
+.pr-name{font-weight:500;font-size:12px;color:var(--gn)}
+.pr-acts{display:flex;gap:3px}
+.pr-field{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+.pr-lbl{font-family:var(--fm);font-size:9px;color:var(--tx3);min-width:90px;text-transform:uppercase}
+.pr-inp{flex:1;background:var(--ink3);border:1px solid var(--rim2);border-radius:3px;
+  padding:3px 6px;color:var(--tx0);font-family:var(--fm);font-size:11px;outline:none}
+.pr-inp:focus{border-color:var(--cy2)}
+
+/* TRAINING TAB */
+.tf-row{display:flex;align-items:center;gap:5px;margin-bottom:5px}
+.tf-lbl{font-family:var(--fm);font-size:9px;color:var(--tx2);min-width:42px;text-transform:uppercase;letter-spacing:.06em}
+.tf-inp{flex:1;background:var(--ink3);border:1px solid var(--rim2);border-radius:var(--r2);
+  padding:4px 7px;color:var(--tx0);font-family:var(--fm);font-size:11px;outline:none}
+.tf-inp:focus{border-color:var(--cy2)}
+select.tf-inp option{background:var(--ink2)}
+.hsvwrap{background:var(--ink2);border:1px solid var(--rim);border-radius:var(--r2);
+  padding:7px;margin-bottom:5px}
+.hsv-lbl{font-family:var(--fm);font-size:9px;color:var(--tx3);text-transform:uppercase;
+  letter-spacing:.08em;margin-bottom:5px}
+.hrow{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+.hl{font-family:var(--fm);font-size:10px;font-weight:500;min-width:12px;text-align:center}
+.hsl{flex:1;appearance:none;height:3px;border-radius:2px;outline:none;cursor:pointer;background:var(--ink4)}
+.hsl::-webkit-slider-thumb{appearance:none;width:11px;height:11px;border-radius:50%;cursor:pointer;border:1px solid var(--ink1)}
+.hnum{font-family:var(--fm);font-size:9px;color:var(--tx2);min-width:20px;text-align:right}
+.cprev{width:100%;height:12px;border-radius:3px;border:1px solid var(--rim);margin:3px 0}
+.cname-lbl{font-family:var(--fm);font-size:9px;color:var(--tx2);text-align:center}
+.obj-item{display:flex;align-items:center;gap:5px;background:var(--ink2);border:1px solid var(--rim);
+  border-radius:var(--r2);padding:5px 7px;margin-bottom:2px}
+.obj-item:hover{border-color:var(--rim2)}
+.obj-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.obj-info{flex:1;min-width:0}
+.obj-name{font-weight:500;font-size:11px}
+.obj-meta{font-family:var(--fm);font-size:9px;color:var(--tx3)}
+.obj-acts{display:flex;gap:2px;flex-shrink:0}
+
+/* SENDBTN */
+.sendbtn{width:100%;font-family:var(--fm);font-size:10px;font-weight:500;letter-spacing:.08em;
+  padding:7px;border-radius:var(--r2);border:1px solid var(--cy2);background:var(--cy-a);
+  color:var(--cy);cursor:pointer;transition:.18s;margin-top:4px}
+.sendbtn:hover{background:rgba(0,212,255,.22)}
+.sendbtn.gn{border-color:var(--gn2);background:var(--gn-a);color:var(--gn)}
+.sendbtn.gn:hover{background:rgba(0,232,136,.2)}
+.sendbtn.rd{border-color:var(--rd2);background:var(--rd-a);color:var(--rd)}
+.sendbtn.rd:hover{background:rgba(255,60,88,.2)}
+
+/* MODAL overlay */
+.modal-bg{position:fixed;inset:0;background:rgba(9,9,15,.82);z-index:200;
+  display:flex;align-items:center;justify-content:center;animation:fadeIn .18s}
+.modal{background:var(--ink2);border:1px solid var(--rim3);border-radius:var(--r);
+  padding:20px;width:360px;max-width:95vw;max-height:90vh;overflow-y:auto}
+.modal h3{font-family:var(--fm);font-size:11px;font-weight:500;letter-spacing:.1em;
+  color:var(--cy);text-transform:uppercase;margin-bottom:14px}
+.modal-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.modal-lbl{font-family:var(--fm);font-size:9px;color:var(--tx2);min-width:100px;text-transform:uppercase}
+.modal-inp{flex:1;background:var(--ink3);border:1px solid var(--rim2);border-radius:var(--r2);
+  padding:5px 8px;color:var(--tx0);font-family:var(--fm);font-size:11px;outline:none}
+.modal-inp:focus{border-color:var(--cy2)}
+.modal-btns{display:flex;gap:6px;margin-top:14px;justify-content:flex-end}
+
+/* TOAST */
+.toast{position:fixed;bottom:12px;right:14px;z-index:999;background:var(--ink3);
+  border:1px solid var(--rim3);border-radius:var(--r);padding:7px 13px;
+  font-family:var(--fm);font-size:11px;color:var(--tx0);
+  box-shadow:0 8px 24px rgba(0,0,0,.4);transform:translateY(12px);opacity:0;transition:.2s;pointer-events:none}
+.toast.show{transform:none;opacity:1}
+.toast.ok {border-color:var(--gn2);color:var(--gn)}
+.toast.err{border-color:var(--rd2);color:var(--rd)}
+.toast.info{border-color:var(--cy2);color:var(--cy)}
+.toast.warn{border-color:var(--yw2);color:var(--yw)}
+
+@keyframes pop{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="logo">⬡ <em>AI Arm</em> Vision System</div>
+  <div class="tbr-gap"></div>
+  <div class="chip" id="chipEdge"   onclick="toggleEdge()"><span class="dot"></span>Edge</div>
+  <div class="chip" id="chipAuto"   onclick="toggleAuto()"><span class="dot"></span>Manual</div>
+  <div class="chip" id="chipPb"    ><span class="dot"></span>Idle</div>
+  <div class="chip warn" id="chipConn"><span class="dot"></span>Connecting…</div>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+
+  <!-- COL 1: VIDEO -->
+  <div class="panel col-vid">
+    <div class="ph">
+      <div class="ph-l"><div class="ph-ico ico-cy">●</div>Live stream</div>
+      <div class="ph-r">OV3660 · VGA</div>
+    </div>
+    <div class="vtools">
+      <button class="itb"    id="btnEdge" onclick="toggleEdge()">◈ Edge</button>
+      <button class="itb gn" id="btnAuto" onclick="toggleAuto()">⬡ Auto</button>
+      <div class="vsep"></div>
+   
+      <button class="itb gn" onclick="callPreset('pick')">↓ Pick</button>
+      <button class="itb"    onclick="callPreset('place')">↗ Place</button>
+      <button class="itb pu" onclick="callHome()">⌂ Home</button>
+      <div class="vsep"></div>
+      <button class="itb rd" id="btnRecord" onclick="toggleRecord()">⏺ Record</button>
+    </div>
+    <div class="vwrap">
+      <img id="streamImg" src="/video_feed" alt="Live stream">
+      <div id="noRuleBanner" style="display:none;position:absolute;top:8px;left:8px;right:8px;
+        background:rgba(15,12,5,.92);border:1px solid var(--yw2);border-radius:6px;
+        padding:8px 12px;font-family:var(--fm);font-size:11px;color:var(--yw);
+        z-index:10;pointer-events:all">
+        <div id="noRuleMsg" style="margin-bottom:6px"></div>
+        <div style="display:flex;gap:6px">
+          <button class="itb yw" onclick="noRuleAddRule()" style="font-size:10px">+ Add recording</button>
+          <button class="itb"    onclick="dismissNoRule()" style="font-size:10px">Dismiss</button>
+        </div>
+      </div>
+      <div class="vhud">
+        <div class="vhud-l">
+          <div class="vhud-tag">ESP32-CAM · OV3660 · 640×480</div>
+          <div class="vhud-pb" id="hudPb"></div>
+        </div>
+        <div class="vhud-t" id="hudTime">–</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COL 2: SERVO -->
+  <div class="panel col-sv">
+    <div class="ph">
+      <div class="ph-l"><div class="ph-ico ico-gn">⊕</div>Servo control</div>
+      <div class="ph-r" id="grDelay" style="color:var(--yw)">Grip delay: 2.0s</div>
+    </div>
+    <div style="flex:1;overflow-y:auto;min-height:0">
+      <div class="sblk">
+        <div class="sh">
+          <span class="sl-name" style="color:var(--cy)">⭮ Base</span>
+          <span class="sl-val" style="color:var(--cy)" id="vBase">90°</span>
+        </div>
+        <input type="range" class="srv" id="slBase" min="0" max="180" value="90" style="accent-color:var(--cy)" oninput="si('base',this.value)">
+        <div class="slims"><span>0°</span><span>90°</span><span>180°</span></div>
+      </div>
+      <div class="sblk">
+        <div class="sh">
+          <span class="sl-name" style="color:var(--gn)">⬆ Shoulder</span>
+          <span class="sl-val" style="color:var(--gn)" id="vShoulder">90°</span>
+        </div>
+        <input type="range" class="srv" id="slShoulder" min="45" max="135" value="90" style="accent-color:var(--gn)" oninput="si('shoulder',this.value)">
+        <div class="slims"><span>45°</span><span>90°</span><span>135°</span></div>
+      </div>
+      <div class="sblk">
+        <div class="sh">
+          <span class="sl-name" style="color:var(--yw)">↪ Elbow</span>
+          <span class="sl-val" style="color:var(--yw)" id="vElbow">45°</span>
+        </div>
+        <input type="range" class="srv" id="slElbow" min="10" max="120" value="45" style="accent-color:var(--yw)" oninput="si('elbow',this.value)">
+        <div class="slims"><span>10°</span><span>45°</span><span>120°</span></div>
+      </div>
+      <div class="sblk">
+        <div class="sh">
+          <span class="sl-name" style="color:var(--rd)">✊ Gripper</span>
+          <span class="sl-val" style="color:var(--rd)" id="vGripper">30°</span>
+        </div>
+        <input type="range" class="srv" id="slGripper" min="0" max="40" value="30" style="accent-color:var(--rd)" oninput="si('gripper',this.value)">
+        <div class="slims"><span>Close 0°</span><span>30° Open</span></div>
+      </div>
+      <div style="padding:5px 10px">
+        <button class="sv-send" onclick="sendServos()">↑ Send positions</button>
+      </div>
+    </div>
+    <div class="preset-sec">
+      <div class="ps-lbl">Presets</div>
+      <div class="ps-grid">
+        <button class="pb" style="border-color:rgba(0,232,136,.3);color:var(--gn)" onclick="callPreset('pick')">Pick</button>
+        <button class="pb" style="border-color:rgba(255,187,0,.3);color:var(--yw)"  onclick="callPreset('place')">Place</button>
+        <button class="pb full home" onclick="callHome()">⌂ Home all</button>
+        <button class="pb full" style="border-color:rgba(155,114,255,.3);color:var(--pu);margin-top:3px" onclick="openSetHomeModal()">✎ Set home position</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- COL 3: RIGHT -->
+  <div class="col-rt">
+
+    <!-- Detections -->
+    <div class="panel">
+      <div class="ph">
+        <div class="ph-l"><div class="ph-ico ico-yw">◉</div>Detected</div>
+        <div class="ph-r" id="detBadge">–</div>
+      </div>
+      <div class="pscroll" id="detList">
+        <div class="det-empty">Waiting for stream…</div>
+      </div>
+    </div>
+
+    <!-- TABS: Recordings / Pick Rules / Training -->
+    <div class="panel tabs" style="min-height:0">
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab('rec')">⏺ Recordings</button>
+        <button class="tab-btn"        onclick="switchTab('pr')">🎯 Pick rules</button>
+        <button class="tab-btn"        onclick="switchTab('tr')">🧬 Training</button>
+      </div>
+
+      <!-- ── RECORDINGS TAB ── -->
+      <div class="tab-pane active pscroll" id="tab-rec">
+
+        <!-- active recording session -->
+        <div id="recSession" style="display:none">
+          <div class="rec-session">
+            <div class="rec-sess-hdr">
+              <span>⏺ RECORDING — <span id="recStepCount">0</span> steps</span>
+              <span style="color:var(--tx2);font-size:9px" id="recHoldVal">Hold: 0.5s</span>
+            </div>
+            <div class="rec-steps-preview" id="recStepsPreview"></div>
+            <div class="rec-sess-btns">
+              <button class="itb rd" onclick="captureStep()">+ Capture position</button>
+              <button class="itb"    onclick="discardLast()">↩ Undo</button>
+              <button class="itb gn" onclick="finishRecording()">✓ Save</button>
+              <button class="itb"    onclick="cancelRecording()">✕ Cancel</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
+              <span style="font-family:var(--fm);font-size:9px;color:var(--tx3)">HOLD (s)</span>
+              <input type="range" style="flex:1;accent-color:var(--cy)" min="0.1" max="5" step="0.1" value="0.5"
+                id="recHold" oninput="document.getElementById('recHoldVal').textContent='Hold: '+this.value+'s'">
+            </div>
+          </div>
+        </div>
+
+        <!-- recordings list -->
+        <div class="rec-list" id="recList">
+          <div class="det-empty">No recordings yet — press ⏺ Record to start</div>
+        </div>
+      </div>
+
+      <!-- ── PICK RULES TAB ── -->
+      <div class="tab-pane pscroll" id="tab-pr" style="padding:6px">
+        <div style="font-family:var(--fm);font-size:9px;color:var(--tx3);margin-bottom:6px;line-height:1.6">
+          Configure per-object pick-and-place routes.<br>
+          When Auto mode detects a trained object, it runs its rule automatically.
+        </div>
+        <div id="prList"></div>
+        <button class="sendbtn gn" onclick="openPrModal(null)">+ New pick rule</button>
+      </div>
+
+      <!-- ── TRAINING TAB ── -->
+      <div class="tab-pane pscroll" id="tab-tr" style="padding:6px">
+        <div class="tf-row">
+          <span class="tf-lbl">Name</span>
+          <input class="tf-inp" id="tName" placeholder="e.g. red_cube">
+        </div>
+        <div class="tf-row">
+          <span class="tf-lbl">Shape</span>
+          <select class="tf-inp" id="tShape">
+            <option value="any">Any</option><option value="Circle">Circle</option>
+            <option value="Square">Square</option><option value="Rectangle">Rectangle</option>
+            <option value="Triangle">Triangle</option><option value="Ellipse">Ellipse</option>
+          </select>
+        </div>
+        <div class="hsvwrap">
+          <div class="hsv-lbl">HSV colour range</div>
+          <div class="hrow">
+            <span class="hl" style="color:#f87171">H</span>
+            <input type="range" class="hsl" id="hLo" min="0" max="179" value="0"   oninput="uHSV()" style="accent-color:#f87171">
+            <span class="hnum" id="nhLo">0</span><span style="color:var(--tx3);font-size:9px">–</span>
+            <input type="range" class="hsl" id="hHi" min="0" max="179" value="179" oninput="uHSV()" style="accent-color:#f87171">
+            <span class="hnum" id="nhHi">179</span>
+          </div>
+          <div class="hrow">
+            <span class="hl" style="color:var(--cy)">S</span>
+            <input type="range" class="hsl" id="sLo" min="0" max="255" value="80"  oninput="uHSV()" style="accent-color:var(--cy)">
+            <span class="hnum" id="nsLo">80</span><span style="color:var(--tx3);font-size:9px">–</span>
+            <input type="range" class="hsl" id="sHi" min="0" max="255" value="255" oninput="uHSV()" style="accent-color:var(--cy)">
+            <span class="hnum" id="nsShi">255</span>
+          </div>
+          <div class="hrow">
+            <span class="hl" style="color:var(--yw)">V</span>
+            <input type="range" class="hsl" id="vLo" min="0" max="255" value="50"  oninput="uHSV()" style="accent-color:var(--yw)">
+            <span class="hnum" id="nvLo">50</span><span style="color:var(--tx3);font-size:9px">–</span>
+            <input type="range" class="hsl" id="vHi" min="0" max="255" value="255" oninput="uHSV()" style="accent-color:var(--yw)">
+            <span class="hnum" id="nvHi">255</span>
+          </div>
+          <div class="cprev" id="cprev"></div>
+          <div class="cname-lbl" id="cname">–</div>
+        </div>
+        <button class="sendbtn" onclick="trainObj()">⊕ Save trained object</button>
+        <div style="font-family:var(--fm);font-size:9px;color:var(--tx3);text-transform:uppercase;
+          letter-spacing:.08em;margin:8px 0 4px">Trained objects</div>
+        <div id="objList"><div class="det-empty">No objects trained</div></div>
+      </div>
+    </div>
+
+  </div><!-- /col-rt -->
+</div><!-- /main -->
+</div><!-- /shell -->
+
+<!-- MODAL (rename / new pick rule) -->
+<div class="modal-bg" id="modalBg" style="display:none" onclick="closeModal(event)">
+  <div class="modal" id="modalBox">
+    <h3 id="modalTitle">Rename recording</h3>
+    <div id="modalBody"></div>
+    <div class="modal-btns">
+      <button class="itb" onclick="closeModal()">Cancel</button>
+      <button class="itb gn" id="modalOk" onclick="modalOk()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- SET HOME MODAL -->
+<div id="homeModalBg" style="display:none;position:fixed;inset:0;background:rgba(9,9,15,.85);
+  z-index:200;align-items:center;justify-content:center">
+  <div style="background:var(--ink2);border:1px solid var(--rim3);border-radius:var(--r);
+    padding:20px;width:340px;max-width:95vw">
+    <h3 style="font-family:var(--fm);font-size:11px;font-weight:500;letter-spacing:.1em;
+      color:var(--pu);text-transform:uppercase;margin-bottom:12px">Set home position</h3>
+    <p style="font-family:var(--fm);font-size:9px;color:var(--tx3);margin-bottom:10px;line-height:1.7">
+      Arm returns here after every recording cycle and on Home press.
+      Adjust sliders then Save, or snap to current physical position.
+    </p>
+    <div id="homeSliders"></div>
+    <div style="display:flex;gap:6px;margin-top:14px;flex-wrap:wrap">
+      <button class="sendbtn gn" style="flex:1" onclick="saveHomePos()">✓ Save</button>
+      <button class="sendbtn" style="flex:1;border-color:var(--cy2);color:var(--cy)" onclick="useCurrent()">⊕ Use current</button>
+      <button class="sendbtn rd" style="flex:1" onclick="closeHomeModal()">✕ Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ══ STATE ══
+// Mirrors Python _DEFAULT_HOME — used as fallback if server unreachable
+const _DEFAULT_HOME={base:90,shoulder:90,elbow:45,gripper:30};
+const SL={base:'slBase',shoulder:'slShoulder',elbow:'slElbow',gripper:'slGripper'};
+const VL={base:'vBase', shoulder:'vShoulder', elbow:'vElbow', gripper:'vGripper'};
+let sv={base:90,shoulder:90,elbow:45,gripper:30};
+let edgeOn=false, autoOn=false, isRecording=false;
+let sendT=null, modalAction=null;
+let currentTab='rec';
+
+// ══ TOAST ══
+function toast(msg,type='info'){
+  const e=document.getElementById('toast');
+  e.textContent=msg; e.className='toast show '+type;
+  clearTimeout(e._t); e._t=setTimeout(()=>e.classList.remove('show'),2600);
+}
+
+// ══ TABS ══
+function switchTab(id){
+  currentTab=id;
+  document.querySelectorAll('.tab-btn').forEach((b,i)=>{
+    const tabs=['rec','pr','tr'];
+    b.className='tab-btn'+(tabs[i]===id?' active':'');
+  });
+  document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));
+  document.getElementById('tab-'+id).classList.add('active');
+  if(id==='pr') loadPickRules();
+  if(id==='tr') loadObjects();
+}
+
+// ══ SERVO ══
+function si(axis, val){
+  sv[axis] = +val;
+  document.getElementById(VL[axis]).textContent = val + '°';
+  clearTimeout(sendT);
+  // Send ONLY the moved axis so esp_move_seq on the server can correctly
+  // decide whether a gripper delay is needed (arm axes present → wait, gripper-only → instant)
+  sendT = setTimeout(() => sendAxis(axis, sv[axis]), 130);
+}
+function sendAxis(axis, val){
+  const payload = {};
+  payload[axis] = val;
+  fetch('/api/servo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+  .then(r=>r.json())
+  .catch(()=>toast('ESP32 offline','err'));
+}
+function sendServos(){
+  // "Send positions" button — sends all axes together;
+  // server applies gripper delay after arm axes settle
+  fetch('/api/servo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(sv)})
+  .then(r=>r.json()).then(d=>toast('Positions sent (grip delay: '+d.gripper_delay+'s)','ok'))
+  .catch(()=>toast('ESP32 offline','err'));
+}
+function callHome(){
+  fetch('/api/home',{method:'POST'}).then(r=>r.json()).then(d=>{
+    const pos = d.home_position || {base:90,shoulder:90,elbow:45,gripper:30};
+    Object.entries(pos).forEach(([a,v])=>{
+      sv[a]=v;
+      if(SL[a]){ document.getElementById(SL[a]).value=v; document.getElementById(VL[a]).textContent=v+'°'; }
+    });
+    toast('Homed','ok');
+  }).catch(()=>toast('ESP32 offline','err'));
+}
+function callPreset(n){
+  const P={
+    pick:{base:90,shoulder:110,elbow:80,gripper:10},
+    place:{base:60,shoulder:105,elbow:75,gripper:30},
+  };
+  const p=P[n]||{}; Object.entries(p).forEach(([k,v])=>{
+    sv[k]=v; document.getElementById(SL[k]).value=v;
+    document.getElementById(VL[k]).textContent=v+'°';
+  });
+  fetch('/api/preset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})})
+  .then(()=>toast(n[0].toUpperCase()+n.slice(1)+' preset','info'))
+  .catch(()=>toast('ESP32 offline','err'));
+}
+
+// ══ VISION TOGGLES ══
+function toggleEdge(){
+  edgeOn=!edgeOn;
+  fetch('/api/toggle_edge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:edgeOn})});
+  document.getElementById('btnEdge').className='itb'+(edgeOn?' on':'');
+  const c=document.getElementById('chipEdge');
+  c.className='chip'+(edgeOn?' on':'');
+  c.innerHTML='<span class="dot"></span>Edge'+(edgeOn?' on':'');
+}
+function toggleAuto(){
+  autoOn=!autoOn;
+  fetch('/api/toggle_auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:autoOn})});
+  document.getElementById('btnAuto').className='itb gn'+(autoOn?' on':'');
+  const c=document.getElementById('chipAuto');
+  c.className='chip'+(autoOn?' on':'');
+  c.innerHTML='<span class="dot"></span>'+(autoOn?'Auto on':'Manual');
+  toast(autoOn?'Auto mode enabled':'Manual mode','info');
+}
+
+// ══ STATUS POLL ══
+function refreshStatus(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    const conn=document.getElementById('chipConn');
+    conn.className='chip live'; conn.innerHTML='<span class="dot"></span>Online';
+    document.getElementById('grDelay').textContent='Grip delay: '+d.gripper_delay+'s';
+    const pb=d.playback||{};
+    const cpb=document.getElementById('chipPb');
+    if(pb.running){
+      cpb.className='chip play';
+      cpb.innerHTML='<span class="dot"></span>Playing: '+pb.name+' '+pb.step+'/'+pb.total;
+      document.getElementById('hudPb').textContent='▶ '+pb.name+' step '+pb.step+'/'+pb.total;
+    } else {
+      cpb.className='chip'; cpb.innerHTML='<span class="dot"></span>Idle';
+      document.getElementById('hudPb').textContent='';
+    }
+    document.getElementById('hudTime').textContent=new Date().toLocaleTimeString();
+    renderDets(d.detections||[]);
+    // keep rec session badge
+    if(d.recording && d.recording.active && !isRecording){
+      // sync state
+    }
+  }).catch(()=>{
+    const conn=document.getElementById('chipConn');
+    conn.className='chip warn'; conn.innerHTML='<span class="dot"></span>Offline';
+  });
+}
+setInterval(refreshStatus,1200);
+
+// ══ DETECTIONS ══
+function renderDets(dets){
+  const el=document.getElementById('detList');
+  document.getElementById('detBadge').textContent=dets.length? dets.length+' objects':'–';
+  if(!dets.length){el.innerHTML='<div class="det-empty">No objects in frame</div>';return;}
+  el.innerHTML=dets.map(d=>`
+    <div class="det-item">
+      <div class="det-pip" style="background:var(--cy)"></div>
+      <div class="det-body">
+        <div class="det-name">${d.name}</div>
+        <div class="det-meta">${d.color} · ${d.shape}</div>
+      </div>
+      <span class="det-pct" style="color:var(--gn)">${Math.round(d.confidence)}%</span>
+    </div>`).join('');
+}
+
+// ══ RECORDING ══
+function toggleRecord(){
+  if(!isRecording) startRecording();
+  else finishRecordingPrompt();
+}
+function startRecording(){
+  fetch('/api/record/start',{method:'POST'}).then(()=>{
+    isRecording=true;
+    document.getElementById('btnRecord').className='itb rd on';
+    document.getElementById('btnRecord').textContent='⏺ Recording…';
+    document.getElementById('recSession').style.display='block';
+    document.getElementById('chipConn'); // no change needed
+    // switch to rec tab
+    switchTab('rec');
+    updateRecSteps([]);
+    toast('Recording started — move servos then press Capture','warn');
+    // ensure chip
+    const c=document.getElementById('chipConn');
+  }).catch(()=>toast('Error','err'));
+}
+function captureStep(){
+  const hold=parseFloat(document.getElementById('recHold').value)||0.5;
+  fetch('/api/record/capture',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({positions:{...sv},hold})})
+  .then(r=>r.json()).then(d=>{
+    toast('Step '+d.step+' captured: B'+d.data.base+'° S'+d.data.shoulder+'° E'+d.data.elbow+'° G'+d.data.gripper+'°','ok');
+    loadRecSteps();
+  }).catch(()=>toast('Capture error','err'));
+}
+function discardLast(){
+  fetch('/api/record/discard_last',{method:'POST'}).then(r=>r.json()).then(d=>{
+    toast('Last step undone ('+d.remaining+' remaining)','info');
+    loadRecSteps();
+  });
+}
+function loadRecSteps(){
+  // get current session steps via status
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    const n=d.recording?d.recording.steps:0;
+    document.getElementById('recStepCount').textContent=n;
+    // rebuild preview from last captured (we don't have full list here; just count)
+  });
+}
+function updateRecSteps(steps){
+  document.getElementById('recStepCount').textContent=steps.length;
+  const pv=document.getElementById('recStepsPreview');
+  pv.innerHTML=steps.map((s,i)=>`
+    <div class="rec-step-row">
+      <span>Step ${i+1}: B${s.base}° S${s.shoulder}° E${s.elbow}° G${s.gripper}°</span>
+      <span>hold ${s.hold}s</span>
+    </div>`).join('');
+}
+function finishRecordingPrompt(){
+  showModal('Save recording','<div class="modal-row"><span class="modal-lbl">Name</span><input class="modal-inp" id="mRecName" value="Recording '+(Date.now()%1000)+'"></div>',
+    ()=>{
+      const name=document.getElementById('mRecName').value.trim()||'Recording';
+      fetch('/api/record/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})
+      .then(r=>r.json()).then(d=>{
+        toast('Saved: '+d.name+' ('+d.steps+' steps)','ok');
+        stopRecordUI(); loadRecordings();
+      }).catch(()=>toast('Save error','err'));
+    });
+}
+function finishRecording(){finishRecordingPrompt();}
+function cancelRecording(){
+  fetch('/api/record/cancel',{method:'POST'}).then(()=>{
+    stopRecordUI(); toast('Recording cancelled','info');
+  });
+}
+function stopRecordUI(){
+  isRecording=false;
+  document.getElementById('btnRecord').className='itb rd';
+  document.getElementById('btnRecord').textContent='⏺ Record';
+  document.getElementById('recSession').style.display='none';
+}
+
+// ══ RECORDINGS LIST ══
+let _playingId=null;
+function loadRecordings(){
+  fetch('/api/recordings/list').then(r=>r.json()).then(data=>{
+    const el=document.getElementById('recList');
+    if(!data.length){el.innerHTML='<div class="det-empty">No recordings — press ⏺ Record to create one</div>';return;}
+    el.innerHTML=data.map(r=>`
+      <div class="rec-item${r.id===_playingId?' playing':''}" id="ri_${r.id}">
+        <div class="rec-ico">▶</div>
+        <div class="rec-info">
+          <div class="rec-name">${esc(r.name)}</div>
+          <div class="rec-meta">${r.steps} steps · ${r.created||''}</div>
+        </div>
+        <div class="rec-acts">
+          <button class="rab rab-pl" onclick="playRec('${r.id}','${esc(r.name)}')">▶</button>
+          <button class="rab rab-ed" onclick="renameRec('${r.id}','${esc(r.name)}')">✎</button>
+          <button class="rab rab-rm" onclick="deleteRec('${r.id}')">✕</button>
+        </div>
+      </div>`).join('');
+  });
+}
+function playRec(id,name){
+  if(_playingId===id){
+    fetch('/api/recordings/stop',{method:'POST'}).then(()=>{_playingId=null;loadRecordings();toast('Stopped','info')});
+    return;
+  }
+  fetch('/api/recordings/play',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})
+  .then(r=>r.json()).then(d=>{
+    if(d.status==='playing'){_playingId=id;loadRecordings();toast('▶ Playing: '+name,'info');}
+    else toast('Cannot play — already running or not found','err');
+  });
+}
+function renameRec(id,currentName){
+  showModal('Rename recording',
+    `<div class="modal-row"><span class="modal-lbl">New name</span><input class="modal-inp" id="mRename" value="${esc(currentName)}"></div>`,
+    ()=>{
+      const name=document.getElementById('mRename').value.trim();
+      if(!name) return;
+      fetch('/api/recordings/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name})})
+      .then(r=>r.json()).then(()=>{toast('Renamed','ok');loadRecordings();})
+      .catch(()=>toast('Error','err'));
+    });
+}
+function deleteRec(id){
+  if(!confirm('Delete this recording?')) return;
+  fetch('/api/recordings/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})
+  .then(r=>r.json()).then(d=>{toast('Deleted: '+d.name,'info');loadRecordings();})
+  .catch(()=>toast('Error','err'));
+}
+
+// ══ PICK RULES ══
+let _editingPr=null;
+function loadPickRules(){
+  fetch('/api/pick_rules').then(r=>r.json()).then(data=>{
+    const el=document.getElementById('prList');
+    if(!data.length){el.innerHTML='<div class="det-empty">No pick rules configured</div>';return;}
+    el.innerHTML=data.map(r=>`
+      <div class="pr-item">
+        <div class="pr-head">
+          <span class="pr-name">◎ ${esc(r.object_name)}</span>
+          <div class="pr-acts">
+            <button class="rab rab-pl" onclick="runPr('${esc(r.object_name)}')">▶ Run</button>
+            <button class="rab rab-ed" onclick="openPrModal('${esc(r.object_name)}')">Edit</button>
+            <button class="rab rab-rm" onclick="deletePr('${esc(r.object_name)}')">✕</button>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 10px">
+          ${prFieldRow('Approach base',r.approach_base+'°')}
+          ${prFieldRow('Drop base',r.drop_base+'°')}
+          ${prFieldRow('Grip open',r.grip_open+'°')}
+          ${prFieldRow('Grip close',r.grip_close+'°')}
+          ${prFieldRow('Drop hold',r.drop_hold+'s')}
+        </div>
+      </div>`).join('');
+  });
+}
+function prFieldRow(label,val){
+  return`<div style="font-family:var(--fm);font-size:9px;color:var(--tx3)">${label}: <span style="color:var(--tx1)">${val}</span></div>`;
+}
+function openPrModal(objectName){
+  // get existing rule if editing
+  fetch('/api/pick_rules').then(r=>r.json()).then(rules=>{
+    const existing=rules.find(r=>r.object_name===objectName)||{};
+    fetch('/api/objects').then(r=>r.json()).then(objs=>{
+      const objOpts=objs.map(o=>`<option value="${esc(o.name)}"${o.name===objectName?'selected':''}>${esc(o.name)}</option>`).join('');
+      const f=(k,def)=>existing[k]!==undefined?existing[k]:def;
+      const body=`
+        <div class="modal-row"><span class="modal-lbl">Object</span>
+          <select class="modal-inp" id="prObj">${objOpts}</select></div>
+        <div style="font-family:var(--fm);font-size:9px;color:var(--tx3);margin-bottom:8px;line-height:1.7">
+          Approach → open gripper → lower → grip → lift → rotate to drop base → release
+        </div>
+        ${mRow('Approach base (°)','prApBase',f('approach_base',90))}
+        ${mRow('Approach shoulder (°)','prApSh',f('approach_shoulder',110))}
+        ${mRow('Grip open (°)','prGripO',f('grip_open',30))}
+        ${mRow('Grip close (°)','prGripC',f('grip_close',0))}
+        ${mRow('Lift shoulder (°)','prLiftSh',f('lift_shoulder',90))}
+        ${mRow('Drop base angle (°)','prDropBase',f('drop_base',0))}
+        ${mRow('Drop shoulder (°)','prDropSh',f('drop_shoulder',110))}
+        ${mRow('Drop hold (s)','prDropHold',f('drop_hold',0.3))}
+      `;
+      showModal(objectName?'Edit pick rule':'New pick rule', body, ()=>{
+        const rule={
+          object_name:       document.getElementById('prObj').value,
+          approach_base:     +document.getElementById('prApBase').value,
+          approach_shoulder: +document.getElementById('prApSh').value,
+          grip_open:         +document.getElementById('prGripO').value,
+          grip_close:        +document.getElementById('prGripC').value,
+          lift_shoulder:     +document.getElementById('prLiftSh').value,
+          drop_base:         +document.getElementById('prDropBase').value,
+          drop_shoulder:     +document.getElementById('prDropSh').value,
+          drop_hold:         +document.getElementById('prDropHold').value,
+        };
+        fetch('/api/pick_rules/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(rule)})
+        .then(r=>r.json()).then(d=>{toast('Pick rule saved for '+d.rule.object_name,'ok');loadPickRules();})
+        .catch(()=>toast('Error','err'));
+      });
+    });
+  });
+}
+function mRow(label,id,def){
+  return`<div class="modal-row"><span class="modal-lbl">${label}</span><input class="modal-inp" id="${id}" type="number" value="${def}"></div>`;
+}
+function runPr(name){
+  fetch('/api/pick_rules/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({object_name:name})})
+  .then(()=>toast('Running pick rule: '+name,'info'))
+  .catch(()=>toast('Error','err'));
+}
+function deletePr(name){
+  if(!confirm('Delete pick rule for "'+name+'"?')) return;
+  fetch('/api/pick_rules/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({object_name:name})})
+  .then(r=>r.json()).then(()=>{toast('Deleted rule for '+name,'info');loadPickRules();})
+  .catch(()=>toast('Error','err'));
+}
+
+// ══ TRAINING ══
+function hN(h){const d=h*2;if(d<15||d>=345)return'Red';if(d<35)return'Orange';if(d<75)return'Yellow';if(d<160)return'Green';if(d<200)return'Cyan';if(d<260)return'Blue';if(d<290)return'Purple';if(d<330)return'Pink';return'Red';}
+function hsvRgb(h,s,v){h=h/179*360;s/=255;v/=255;const c=v*s,x=c*(1-Math.abs(h/60%2-1)),m=v-c;let r=0,g=0,b=0;if(h<60){r=c;g=x}else if(h<120){r=x;g=c}else if(h<180){g=c;b=x}else if(h<240){g=x;b=c}else if(h<300){r=x;b=c}else{r=c;b=x}return`rgb(${Math.round((r+m)*255)},${Math.round((g+m)*255)},${Math.round((b+m)*255)})`;}
+function uHSV(){
+  const hL=+document.getElementById('hLo').value,hH=+document.getElementById('hHi').value;
+  const sL=+document.getElementById('sLo').value,sH=+document.getElementById('sHi').value;
+  const vL=+document.getElementById('vLo').value,vH=+document.getElementById('vHi').value;
+  [['nhLo',hL],['nhHi',hH],['nsLo',sL],['nsShi',sH],['nvLo',vL],['nvHi',vH]]
+    .forEach(([id,v])=>document.getElementById(id).textContent=v);
+  document.getElementById('cprev').style.background=
+    `linear-gradient(90deg,${hsvRgb(hL,(sL+sH)/2,(vL+vH)/2)},${hsvRgb(hH,(sL+sH)/2,(vL+vH)/2)})`;
+  document.getElementById('cname').textContent=hN((hL+hH)/2);
+}
+uHSV();
+function trainObj(){
+  const name=document.getElementById('tName').value.trim();
+  if(!name){toast('Enter a name first','err');return;}
+  const lo=[+document.getElementById('hLo').value,+document.getElementById('sLo').value,+document.getElementById('vLo').value];
+  const hi=[+document.getElementById('hHi').value,+document.getElementById('sHi').value,+document.getElementById('vHi').value];
+  fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,shape:document.getElementById('tShape').value,color_lower:lo,color_upper:hi})})
+  .then(r=>r.json()).then(d=>{
+    toast('Trained: '+d.object.name+' ('+d.object.color+' '+d.object.shape+')','ok');
+    document.getElementById('tName').value='';
+    loadObjects();
+  }).catch(()=>toast('Training error','err'));
+}
+function loadObjects(){
+  fetch('/api/objects').then(r=>r.json()).then(data=>{
+    const el=document.getElementById('objList');
+    if(!data.length){el.innerHTML='<div class="det-empty">No objects trained</div>';return;}
+    el.innerHTML=data.map((obj,i)=>{
+      const mH=(obj.color_lower[0]+obj.color_upper[0])/2;
+      const mS=(obj.color_lower[1]+obj.color_upper[1])/2;
+      const mV=(obj.color_lower[2]+obj.color_upper[2])/2;
+      const dot=hsvRgb(mH,mS,mV);
+      return`<div class="obj-item">
+        <div class="obj-dot" style="background:${dot}"></div>
+        <div class="obj-info">
+          <div class="obj-name">${esc(obj.name)}</div>
+          <div class="obj-meta">${obj.color} · ${obj.shape} · H ${obj.color_lower[0]}–${obj.color_upper[0]}</div>
+        </div>
+        <div class="obj-acts">
+          <button class="rab rab-ed" onclick="openPrModal('${esc(obj.name)}')" title="Create pick rule">⊕ Rule</button>
+          <button class="rab rab-rm" onclick="delObj(${i})">✕</button>
+        </div>
+      </div>`;
+    }).join('');
+  });
+}
+function delObj(idx){
+  if(!confirm('Delete this object?')) return;
+  fetch('/api/delete_object',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx})})
+  .then(r=>r.json()).then(d=>{toast('Deleted: '+d.name,'info');loadObjects();})
+  .catch(()=>toast('Error','err'));
+}
+
+// ══ MODAL ══
+function showModal(title, body, okFn){
+  document.getElementById('modalTitle').textContent=title;
+  document.getElementById('modalBody').innerHTML=body;
+  modalAction=okFn;
+  document.getElementById('modalBg').style.display='flex';
+}
+function closeModal(e){
+  if(e && e.target!==document.getElementById('modalBg')) return;
+  document.getElementById('modalBg').style.display='none';
+  modalAction=null;
+}
+function modalOk(){
+  if(modalAction) modalAction();
+  document.getElementById('modalBg').style.display='none';
+  modalAction=null;
+}
+
+// ══ UTILS ══
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+// ══ WEB AUDIO BEEP ══
+// Works in browser with no external libraries
+function _beepBrowser(count, freq=880, dur=120) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    let t = ctx.currentTime;
+    for (let i = 0; i < count; i++) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.4, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + dur/1000);
+      osc.start(t); osc.stop(t + dur/1000 + 0.01);
+      t += (dur + 180) / 1000;
+    }
+    setTimeout(() => ctx.close(), (dur + 200) * count);
+  } catch(e) {}
+}
+
+// ══ HOME POSITION MODAL ══
+const HOME_LIMITS = {base:[0,180],shoulder:[45,135],elbow:[10,120],gripper:[0,40]};
+const HOME_COLORS = {base:'var(--cy)',shoulder:'var(--gn)',elbow:'var(--yw)',gripper:'var(--rd)'};
+let _homeVals = {base:90,shoulder:90,elbow:45,gripper:30};
+
+function openSetHomeModal() {
+  fetch('/api/home_pos').then(r=>r.json()).then(pos=>{
+    _homeVals = {...pos};
+    const axes = ['base','shoulder','elbow','gripper'];
+    document.getElementById('homeSliders').innerHTML = axes.map(a=>{
+      const [lo,hi]=HOME_LIMITS[a]; const v=pos[a]||_homeVals[a];
+      return `<div style="margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+          <span style="font-family:var(--fm);font-size:10px;font-weight:500;color:${HOME_COLORS[a]};text-transform:uppercase">${a}</span>
+          <span style="font-family:var(--fm);font-size:12px;color:${HOME_COLORS[a]}" id="hv_${a}">${v}°</span>
+        </div>
+        <input type="range" style="width:100%;accent-color:${HOME_COLORS[a]}"
+          min="${lo}" max="${hi}" value="${v}"
+          oninput="_homeVals['${a}']=+this.value;document.getElementById('hv_${a}').textContent=this.value+'°'">
+        <div style="display:flex;justify-content:space-between;font-family:var(--fm);font-size:9px;color:var(--tx3)">
+          <span>${lo}°</span><span>${hi}°</span>
+        </div>
+      </div>`;
+    }).join('');
+    document.getElementById('homeModalBg').style.display='flex';
+  }).catch(()=>toast('Could not fetch home position','err'));
+}
+function closeHomeModal(){document.getElementById('homeModalBg').style.display='none';}
+function saveHomePos(){
+  fetch('/api/home_pos/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_homeVals)})
+  .then(r=>r.json()).then(()=>{toast('Home position saved','ok');closeHomeModal();})
+  .catch(()=>toast('Error saving','err'));
+}
+function useCurrent(){
+  fetch('/api/home_pos/use_current',{method:'POST'})
+  .then(r=>r.json()).then(d=>{toast('Home set to current arm position','ok');closeHomeModal();})
+  .catch(()=>toast('Error','err'));
+}
+
+// ══ NO-RULE PROMPT ══
+let _noRuleTarget = null;
+function noRuleAddRule(){
+  if(_noRuleTarget){ switchTab('rec'); dismissNoRule(); }
+}
+function dismissNoRule(){
+  document.getElementById('noRuleBanner').style.display='none';
+  if(_noRuleTarget){
+    fetch('/api/auto/dismiss_prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:_noRuleTarget})});
+    _noRuleTarget=null;
+  }
+}
+
+// ══ ENHANCED refreshStatus ══
+// Override the existing refreshStatus to add auto_action,
+// no_rule_prompt, home_position, and beep triggering
+const _prevRefresh = refreshStatus;
+let _lastAction = 'IDLE';
+refreshStatus = function(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    // connection
+    document.getElementById('chipConn').className='chip live';
+    document.getElementById('chipConn').innerHTML='<span class="dot"></span>Online';
+    // grip delay
+    if(d.gripper_delay!==undefined)
+      document.getElementById('grDelay').textContent='Grip delay: '+d.gripper_delay+'s';
+    // auto action → beep on state transition
+    const action = d.auto_action || 'IDLE';
+    if(action !== _lastAction) {
+      if(action.startsWith('PICK') || action.startsWith('RULE'))
+        _beepBrowser(1, 880, 120);    // 1 beep — accepted
+      else if(action.startsWith('REJECT'))
+        _beepBrowser(3, 440, 100);    // 3 beeps — wrong
+      _lastAction = action;
+    }
+    // action chip
+    const ca = document.getElementById('chipPb');
+    if(d.playback && d.playback.running) {
+      ca.className='chip play';
+      ca.innerHTML='<span class="dot"></span>▶ '+d.playback.name+' '+d.playback.step+'/'+d.playback.total;
+      document.getElementById('hudPb').textContent='▶ '+d.playback.name+' '+d.playback.step+'/'+d.playback.total;
+    } else if(action!=='IDLE'&&action!=='MONITORING') {
+      ca.className='chip play';
+      ca.innerHTML='<span class="dot"></span>'+action;
+      document.getElementById('hudPb').textContent=action;
+    } else {
+      ca.className='chip'; ca.innerHTML='<span class="dot"></span>Idle';
+      document.getElementById('hudPb').textContent='';
+    }
+    // no-rule banner
+    const noRule = d.no_rule_prompt||[];
+    const banner = document.getElementById('noRuleBanner');
+    if(noRule.length && !_noRuleTarget) {
+      _noRuleTarget = noRule[0];
+      document.getElementById('noRuleMsg').textContent =
+        'Auto: "'+_noRuleTarget+'" detected but has no recording. Create a recording named "'+_noRuleTarget+'" to enable auto-pick.';
+      banner.style.display='block';
+    } else if(!noRule.length) {
+      banner.style.display='none';
+    }
+    // detections with accept/reject colouring
+    const det=d.detections||[];
+    document.getElementById('detBadge').textContent=det.length?det.length+' objects':'–';
+    const dl=document.getElementById('detList');
+    if(!det.length){dl.innerHTML='<div class="det-empty">No objects in frame</div>';return;}
+    dl.innerHTML=det.map(d=>{
+      const col=d.accepted?'var(--gn)':'var(--rd)';
+      const tag=d.accepted?'ACCEPT':'REJECT';
+      return`<div class="det-item">
+        <div class="det-pip" style="background:${col}"></div>
+        <div class="det-body">
+          <div class="det-name" style="color:${col}">${esc(d.name)}</div>
+          <div class="det-meta">${d.color} · ${d.shape}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+          <span style="font-family:var(--fm);font-size:9px;padding:1px 5px;border-radius:3px;
+            border:1px solid ${col};color:${col}">${tag}</span>
+          <span class="det-pct" style="color:${col}">${Math.round(d.confidence)}%</span>
+        </div>
+      </div>`;
+    }).join('');
+    document.getElementById('hudTime').textContent=new Date().toLocaleTimeString();
+  }).catch(()=>{
+    document.getElementById('chipConn').className='chip warn';
+    document.getElementById('chipConn').innerHTML='<span class="dot"></span>Offline';
+  });
+};
+
+// close home modal on backdrop click
+document.getElementById('homeModalBg').addEventListener('click',function(e){
+  if(e.target===this) closeHomeModal();
+});
+
+// ══ INIT — sync sliders to server home_position ══
+function syncSlidersToHome(pos) {
+  // Update sv{} and all slider elements to match the stored home_position
+  const axMap = {base:'slBase',shoulder:'slShoulder',elbow:'slElbow',gripper:'slGripper'};
+  const vlMap = {base:'vBase', shoulder:'vShoulder', elbow:'vElbow', gripper:'vGripper'};
+  Object.entries(pos).forEach(([ax, val]) => {
+    if(ax in axMap) {
+      sv[ax] = val;
+      const sl = document.getElementById(axMap[ax]);
+      const vl = document.getElementById(vlMap[ax]);
+      if(sl) sl.value = val;
+      if(vl) vl.textContent = val + '°';
+    }
+  });
+}
+
+function initPage() {
+  // Fetch home_position from server — sets sliders to the real stored values
+  fetch('/api/home_pos').then(r=>r.json()).then(pos=>{
+    syncSlidersToHome(pos);
+    // Also update _homeVals for the Set Home modal
+    _homeVals = {...pos};
+  }).catch(()=>{
+    // If unreachable, sliders keep their HTML default values (matching _DEFAULT_HOME)
+  });
+  loadRecordings();
+  refreshStatus();
+}
+
+initPage();
+</script>
+</body>
+</html>
+"""
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print("=" * 58)
+    print("  AI-BASED ROBOTIC ARM VISION SYSTEM  v5")
+    print(f"  ESP32       : {ESP32_IP}")
+    print(f"  Web UI      : http://0.0.0.0:{PORT}")
+    print(f"  Data dir    : {DATA_DIR}")
+    print(f"  Grip delay  : {GRIPPER_DELAY_SEC}s")
+    print(f"  Recordings  : {RECORDINGS_FILE}")
+    print(f"  Pick rules  : {PICK_RULES_FILE}")
+    print(f"  Training    : {TRAINING_FILE}")
+    print("=" * 58)
+    app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False)
