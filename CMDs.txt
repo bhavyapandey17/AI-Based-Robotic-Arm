@@ -1,0 +1,4 @@
+
+https://www.python.org/downloads/release/python-3120/
+
+pip install -r requirements.txt
