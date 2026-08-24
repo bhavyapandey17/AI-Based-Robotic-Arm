@@ -1,0 +1,18 @@
+[
+  {
+    "object_name": "red_cube",
+    "approach_base": 90,
+    "approach_shoulder": 56,
+    "approach_elbow": 80,
+    "grip_open": 10,
+    "grip_shoulder": 120,
+    "grip_close": 30,
+    "lift_shoulder": 90,
+    "drop_base": 20,
+    "drop_shoulder": 70,
+    "drop_elbow": 80,
+    "drop_open": 30,
+    "drop_hold": 0.3,
+    "updated": "2026-05-31 16:10:10"
+  }
+]
