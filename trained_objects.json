@@ -1,0 +1,18 @@
+[
+  {
+    "name": "red_cube",
+    "color": "Cyan",
+    "shape": "any",
+    "color_lower": [
+      0,
+      80,
+      50
+    ],
+    "color_upper": [
+      179,
+      255,
+      255
+    ],
+    "added": "2026-05-31 16:00:22"
+  }
+]
